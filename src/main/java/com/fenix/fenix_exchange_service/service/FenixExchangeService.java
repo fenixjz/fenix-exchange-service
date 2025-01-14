@@ -13,6 +13,8 @@ import org.springframework.stereotype.Service;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -24,6 +26,26 @@ import static com.fenix.fenix_exchange_service.service.FenixConstant.RATES_FILE_
 @Service
 @RequiredArgsConstructor
 public class FenixExchangeService {
+
+    private final ObjectMapper objectMapper;
+
+    /**
+     * Retrieves a list of all available currency codes from the exchange rates.
+     *
+     * @return A list of currency codes (e.g., ["USD", "EUR", "JPY"]). If no rates are available,
+     *         returns an empty list.
+     * @throws RuntimeException If the exchange rates file is missing or corrupted.
+     */
+    public List<String> currencies() {
+        if (!isFileUpToDate()) {
+            saveRates();
+        }
+        ExchangeRatesResponse json = json2object();
+        if (json.getRates() == null || json.getRates().isEmpty()) {
+            return Collections.emptyList();
+        }
+        return new ArrayList<>(json.getRates().keySet());
+    }
 
     /**
      * Converts an amount from one currency to another using exchange rates.
@@ -40,6 +62,10 @@ public class FenixExchangeService {
     public ExchangeAmount exchange(String fromCurrency, String toCurrency, Double amount) {
         if (amount == null || amount <= 0) {
             throw new IllegalArgumentException("Amount must be greater than 0.");
+        }
+
+        if (!isFileUpToDate()) {
+            saveRates();
         }
 
         ExchangeRatesResponse json = json2object();
@@ -66,27 +92,12 @@ public class FenixExchangeService {
     }
 
     /**
-     * Retrieves a list of all available currency codes from the exchange rates.
-     *
-     * @return A list of currency codes (e.g., ["USD", "EUR", "JPY"]). If no rates are available,
-     *         returns an empty list.
-     * @throws RuntimeException If the exchange rates file is missing or corrupted.
-     */
-    public List<String> currencies() {
-        ExchangeRatesResponse json = json2object();
-        if (json.getRates() == null || json.getRates().isEmpty()) {
-            return Collections.emptyList(); // Ako nema kurseva, vrati praznu listu
-        }
-        return new ArrayList<>(json.getRates().keySet());
-    }
-
-    /**
      * Fetches the latest exchange rates from the external API and saves them as a JSON file.
      * The JSON file is stored in the location specified by RATES_FILE_PATH.
      *
      * @throws RuntimeException If the API request fails or if the JSON cannot be saved.
      */
-    void saveRates() {
+    private void saveRates() {
         OkHttpClient client = new OkHttpClient.Builder().build();
         Request request = new Request.Builder()
                 .url(BASE_URL)
@@ -97,12 +108,11 @@ public class FenixExchangeService {
             if (response.isSuccessful() && response.body() != null) {
                 String responseBody = response.body().string();
                 saveJsonToFile(responseBody);
-                System.out.println("JSON successfully saved to rates.json");
             } else {
-                System.err.println("Request failed: " + response.code());
+                throw new IOException("Unexpected code " + response.code());
             }
         } catch (IOException e) {
-            System.err.println("Error while fetching rates: " + e.getMessage());
+            throw new RuntimeException(e.getMessage());
         }
     }
 
@@ -113,12 +123,11 @@ public class FenixExchangeService {
      * @throws RuntimeException If the JSON file is missing or if an error occurs during parsing.
      */
     private ExchangeRatesResponse json2object() {
-        File file = new File(RATES_FILE_PATH);
+        File file = new File(getRatesFilePath());
         if (!file.exists()) {
-            throw new RuntimeException("File not found: " + RATES_FILE_PATH);
+            throw new RuntimeException("File not found");
         }
         try {
-            ObjectMapper objectMapper = new ObjectMapper();
             return objectMapper.readValue(file, ExchangeRatesResponse.class);
         } catch (IOException e) {
             throw new RuntimeException(e.getMessage());
@@ -134,12 +143,11 @@ public class FenixExchangeService {
      */
     private void saveJsonToFile(String jsonContent) {
         try {
-            ObjectMapper objectMapper = new ObjectMapper();
             Object json = objectMapper.readValue(jsonContent, Object.class);
             ObjectWriter writer = objectMapper.writerWithDefaultPrettyPrinter();
             String formattedJson = writer.writeValueAsString(json);
 
-            File file = new File(RATES_FILE_PATH);
+            File file = new File(getRatesFilePath());
             File parentDir = file.getParentFile();
             if (parentDir != null && !parentDir.exists()) {
                 boolean created = parentDir.mkdirs();
@@ -153,10 +161,62 @@ public class FenixExchangeService {
                 fileWriter.write(formattedJson);
                 fileWriter.flush();
             }
-
-            System.out.println("Formatted JSON successfully saved to " + file.getAbsolutePath());
         } catch (IOException e) {
-            System.err.println("Error while saving formatted JSON to file: " + e.getMessage());
+            throw new RuntimeException(e.getMessage());
+        }
+    }
+
+    /**
+     * Determines the directory where the library (JAR file or class files) is located.
+     *
+     * @return The absolute path to the directory containing the JAR file or class files.
+     *         If the library is being executed directly from a directory, the directory path is returned.
+     * @throws RuntimeException If the library directory cannot be determined due to an error.
+     */
+    private String getLibraryDirectory() {
+        try {
+            String jarPath = FenixExchangeService.class.getProtectionDomain().getCodeSource().getLocation().toURI().getPath();
+            File jarFile = new File(jarPath);
+            return jarFile.isDirectory() ? jarFile.getAbsolutePath() : jarFile.getParent();
+        } catch (Exception e) {
+            throw new RuntimeException("Unable to determine library directory", e);
+        }
+    }
+
+    /**
+     * Constructs the full file path for the rates.json file within the library's directory.
+     *
+     * @return The absolute path to the rates.json file inside the library's directory.
+     *         This path combines the library's directory path and the predefined RATES_FILE_PATH.
+     */
+    private String getRatesFilePath() {
+        return getLibraryDirectory() + File.separator + RATES_FILE_PATH;
+    }
+
+    /**
+     * Checks if the rates.json file is up-to-date based on the date stored in the file.
+     * The method verifies if the JSON file exists and if the date in the file corresponds
+     * to the current UTC date or the previous UTC date. If the file does not exist or its
+     * content is outdated, the method returns false.
+     *
+     * @return true if the file exists and its date is either today or yesterday in UTC;
+     *         false otherwise.
+     * @throws RuntimeException If an error occurs while reading or parsing the file.
+     */
+    private boolean isFileUpToDate() {
+        File file = new File(getRatesFilePath());
+        if (!file.exists()) {
+            return false;
+        }
+        try {
+            ExchangeRatesResponse json = objectMapper.readValue(file, ExchangeRatesResponse.class);
+
+            String fileDate = json.getDate();
+            LocalDate fileLocalDate = LocalDate.parse(fileDate);
+            LocalDate currentUtcDate = LocalDate.now(ZoneOffset.UTC);
+            return fileLocalDate.equals(currentUtcDate) || fileLocalDate.equals(currentUtcDate.minusDays(1));
+        } catch (IOException e) {
+            return false;
         }
     }
 }
